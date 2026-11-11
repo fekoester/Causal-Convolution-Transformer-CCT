@@ -1,0 +1,32 @@
+[project]
+name = "cct"
+version = "0.2.0"
+description = "Causal Convolution Transformer: a GPT-style LM with a causal-convolution residual branch"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Felix Köster"}]
+dependencies = ["torch>=2.1", "numpy", "tqdm", "requests", "tiktoken"]
+
+[project.optional-dependencies]
+openwebtext = ["datasets>=2.18"]
+plot = ["matplotlib", "pandas"]
+dev = ["pytest>=7", "ruff>=0.5"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["cct*"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+ignore = ["B905"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
