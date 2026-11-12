@@ -1,11 +1,8 @@
-# CPU wheels from PyTorch (portable). For GPU, see note below.
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-torchvision
-torchaudio
-transformers
-datasets
+torch>=2.1
+numpy
 tqdm
+requests
+tiktoken
+datasets>=2.18  # openwebtext only
 matplotlib
 pandas
-requests

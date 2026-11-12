@@ -1,152 +1,157 @@
-# cct/download_data.py
-import os
+"""
+Prepare tokenized datasets: train.bin / val.bin (uint16) + meta.json in a data directory.
+
+  tiny          tiny Shakespeare, character level (downloaded)
+  text          any local text file, character level (--text-file)
+  openwebtext   OpenWebText, GPT-2 BPE, streamed from the Hugging Face Hub (Parquet copy), documents
+                separated by the end-of-text token; tokens are written to disk in chunks, so memory
+                stays flat for the full corpus (~9B tokens)
+"""
+
+from __future__ import annotations
+
 import json
+import os
+from typing import Any, Literal
+
 import numpy as np
-from typing import Literal, Dict, Any
-
 from tqdm import tqdm
-from datasets import load_dataset
 
-from .tokenizer import get_gpt2_tokenizer
+from .tokenizer import EOT_ID, get_gpt2_tokenizer
+
+OWT_SOURCES = ("dylanebert/openwebtext", "Skylion007/openwebtext")
+CHUNK = 1 << 22
 
 
-def _save_meta(data_dir: str, meta: Dict[str, Any]) -> None:
+def _save_meta(data_dir: str, meta: dict[str, Any]) -> None:
     os.makedirs(data_dir, exist_ok=True)
     with open(os.path.join(data_dir, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
 
-def _load_meta_if_exists(data_dir: str) -> Dict[str, Any] | None:
+def _load_meta_if_exists(data_dir: str) -> dict[str, Any] | None:
     path = os.path.join(data_dir, "meta.json")
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     return None
 
 
 def _already_prepared(data_dir: str) -> bool:
-    return (
-        os.path.exists(os.path.join(data_dir, "train.bin"))
-        and os.path.exists(os.path.join(data_dir, "val.bin"))
-        and os.path.exists(os.path.join(data_dir, "meta.json"))
-    )
+    return all(os.path.exists(os.path.join(data_dir, f)) for f in ("train.bin", "val.bin", "meta.json"))
+
+
+def _split_to_files(all_path: str, data_dir: str, val_fraction: float) -> tuple[int, int]:
+    """Copy the last `val_fraction` of the tokens in all_path to val.bin, the rest to train.bin."""
+    src = np.memmap(all_path, dtype=np.uint16, mode="r")
+    n = len(src)
+    n_train = n - max(1, int(n * val_fraction))
+    for name, a, b in (("train.bin", 0, n_train), ("val.bin", n_train, n)):
+        out = np.memmap(os.path.join(data_dir, name), dtype=np.uint16, mode="w+", shape=(b - a,))
+        for i in range(a, b, CHUNK):
+            j = min(i + CHUNK, b)
+            out[i - a: j - a] = src[i:j]
+        out.flush()
+        del out
+    del src
+    os.remove(all_path)
+    return n_train, n - n_train
+
+
+def prepare_char_level(text: str, data_dir: str, dataset_name: str, val_fraction: float = 0.1) -> None:
+    """Character-level dataset from a string: sorted character vocabulary, 90/10 split."""
+    os.makedirs(data_dir, exist_ok=True)
+    itos = sorted(set(text))
+    if len(itos) > 65535:
+        raise ValueError("character vocabulary does not fit in uint16")
+    stoi = {ch: i for i, ch in enumerate(itos)}
+    ids = np.fromiter((stoi[c] for c in text), dtype=np.uint16, count=len(text))
+    split = int((1.0 - val_fraction) * len(ids))
+    ids[:split].tofile(os.path.join(data_dir, "train.bin"))
+    ids[split:].tofile(os.path.join(data_dir, "val.bin"))
+    _save_meta(data_dir, {"dataset": dataset_name, "tokenizer": "char", "itos": itos, "vocab_size": len(itos)})
+    print(f"[cct] {dataset_name}: vocab {len(itos)}, {split} train / {len(ids) - split} val characters")
 
 
 def _prepare_tiny(data_dir: str) -> None:
-    """
-    Tiny Shakespeare (char-level).
-    Saves:
-      - train.bin / val.bin (uint16 ids)
-      - meta.json with {'dataset':'tiny','itos':[...],'vocab_size':N}
-    """
-    os.makedirs(data_dir, exist_ok=True)
-    train_path = os.path.join(data_dir, "train.bin")
-    val_path = os.path.join(data_dir, "val.bin")
-
-    if _already_prepared(data_dir):
-        print(f"[cct] Found existing tiny Shakespeare dataset in {data_dir}")
-        return
-
-    print("[cct] Downloading tiny Shakespeare (char-level)…")
     import requests
 
+    print("[cct] Downloading tiny Shakespeare (char-level)…")
     url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-    text = requests.get(url, timeout=60).text
-
-    print("[cct] Building char vocabulary…")
-    chars = sorted(list(set(text)))
-    itos = chars
-    stoi = {ch: i for i, ch in enumerate(itos)}
-    vocab_size = len(itos)
-    print(f"[cct] tiny vocab_size = {vocab_size}")
-
-    print("[cct] Encoding to ids…")
-    ids = np.array([stoi[c] for c in text], dtype=np.uint32)  # temporary
-    # 90/10 split
-    split = int(0.9 * len(ids))
-    train_ids = ids[:split]
-    val_ids = ids[split:]
-
-    # safe to uint16 since vocab_size <= 65535 by a wide margin here
-    train_ids.astype(np.uint16).tofile(train_path)
-    val_ids.astype(np.uint16).tofile(val_path)
-
-    _save_meta(data_dir, {"dataset": "tiny", "itos": itos, "vocab_size": vocab_size})
-
-    print(f"[cct] Saved {train_path} ({len(train_ids)} tokens)")
-    print(f"[cct] Saved {val_path} ({len(val_ids)} tokens)")
-    print("[cct] tiny Shakespeare ready.")
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    prepare_char_level(r.text, data_dir, "tiny")
 
 
-def _prepare_openwebtext(data_dir: str, subset: str | None = None) -> None:
-    """
-    OpenWebText via HuggingFace (GPT-2 BPE).
-    subset: optional HF split slice like "train[:1%]" for quick tests.
-    Saves:
-      - train.bin / val.bin (uint16 ids)
-      - meta.json with {'dataset':'openwebtext','vocab_size':50257}
-    """
+def _iter_owt(subset: str | None, max_docs: int | None):
+    from datasets import load_dataset
+
+    last_err = None
+    for name in OWT_SOURCES:
+        try:
+            if subset:  # an HF split slice such as "train[:1%]" (downloads that part)
+                ds = load_dataset(name, split=subset)
+            else:
+                ds = load_dataset(name, split="train", streaming=True)
+            break
+        except Exception as e:  # try the next mirror
+            last_err = e
+    else:
+        raise RuntimeError(f"Could not load OpenWebText from {OWT_SOURCES}: {last_err}")
+    for i, ex in enumerate(ds):
+        if max_docs is not None and i >= max_docs:
+            break
+        yield ex["text"]
+
+
+def _prepare_openwebtext(data_dir: str, subset: str | None = None, max_docs: int | None = None,
+                         val_fraction: float = 0.1) -> None:
     os.makedirs(data_dir, exist_ok=True)
-    train_path = os.path.join(data_dir, "train.bin")
-    val_path = os.path.join(data_dir, "val.bin")
-
-    if _already_prepared(data_dir):
-        print(f"[cct] Found existing OpenWebText dataset in {data_dir}")
-        return
-
-    split = subset if subset else "train"
-    print(f"[cct] Downloading OpenWebText (split='{split}') via HuggingFace…")
-    dataset = load_dataset("openwebtext", split=split)
-
-    print("[cct] Tokenizing with GPT-2 tokenizer (this can take a while)…")
     tok = get_gpt2_tokenizer()
-
-    # Accumulate ids across docs, then 90/10 split by token count
-    all_ids = []
-    for ex in tqdm(dataset, desc="Tokenizing OWT"):
-        ids = tok.encode(ex["text"])
-        all_ids.extend(ids)
-
-    total = len(all_ids)
-    print(f"[cct] Total tokens: {total}")
-    if total == 0:
+    all_path = os.path.join(data_dir, "all.tmp.bin")
+    n, buf = 0, []
+    print(f"[cct] Tokenizing OpenWebText ({subset or 'full, streamed'}) with GPT-2 BPE…")
+    with open(all_path, "wb") as f:
+        for text in tqdm(_iter_owt(subset, max_docs), desc="Tokenizing OWT", unit="doc"):
+            ids = tok.encode_ordinary(text)
+            if ids:
+                buf.extend(ids)
+                buf.append(EOT_ID)
+            if len(buf) >= CHUNK:
+                np.asarray(buf, dtype=np.uint16).tofile(f)
+                n += len(buf)
+                buf = []
+        if buf:
+            np.asarray(buf, dtype=np.uint16).tofile(f)
+            n += len(buf)
+    if n == 0:
         raise RuntimeError("No tokens produced. Check dataset download/tokenizer.")
-
-    split_ix = int(0.9 * total)
-    train_ids = np.array(all_ids[:split_ix], dtype=np.uint32)
-    val_ids = np.array(all_ids[split_ix:], dtype=np.uint32)
-
-    # GPT-2 vocab fits in uint16 (0..50256)
-    train_ids.astype(np.uint16).tofile(train_path)
-    val_ids.astype(np.uint16).tofile(val_path)
-
-    _save_meta(data_dir, {"dataset": "openwebtext", "vocab_size": 50257})
-
-    print(f"[cct] Saved {train_path} ({len(train_ids)} tokens)")
-    print(f"[cct] Saved {val_path} ({len(val_ids)} tokens)")
-    print("[cct] OpenWebText ready.")
+    n_train, n_val = _split_to_files(all_path, data_dir, val_fraction)
+    _save_meta(data_dir, {"dataset": "openwebtext", "tokenizer": "gpt2", "vocab_size": 50257, "eot_id": EOT_ID})
+    print(f"[cct] OpenWebText ready: {n_train} train / {n_val} val tokens")
 
 
 def prepare_dataset(
     data_dir: str,
-    dataset: Literal["openwebtext", "tiny"] = "openwebtext",
+    dataset: Literal["openwebtext", "tiny", "text"] = "openwebtext",
     subset: str | None = None,
-) -> Dict[str, Any]:
-    """
-    Ensure tokenized dataset exists in data_dir.
-    Returns the meta dict.
-    - dataset="openwebtext" (default): GPT-2 BPE tokenizer; optional subset like "train[:1%]".
-    - dataset="tiny": tiny Shakespeare char-level tokenizer.
-
-    Files created: train.bin, val.bin, meta.json
-    """
-    meta = _load_meta_if_exists(data_dir)
+    text_file: str | None = None,
+    max_docs: int | None = None,
+) -> dict[str, Any]:
+    """Ensure a tokenized dataset exists in data_dir (train.bin, val.bin, meta.json); return its meta."""
     if not _already_prepared(data_dir):
         if dataset == "tiny":
             _prepare_tiny(data_dir)
+        elif dataset == "text":
+            if not text_file:
+                raise ValueError("--dataset text needs --text-file")
+            with open(text_file, encoding="utf-8") as f:
+                prepare_char_level(f.read(), data_dir, "text")
         else:
-            _prepare_openwebtext(data_dir, subset=subset)
-        meta = _load_meta_if_exists(data_dir)
+            _prepare_openwebtext(data_dir, subset=subset, max_docs=max_docs)
+    else:
+        print(f"[cct] Found existing dataset in {data_dir}")
+    meta = _load_meta_if_exists(data_dir)
     if meta is None:
         raise RuntimeError("prepare_dataset failed to write meta.json")
     return meta
